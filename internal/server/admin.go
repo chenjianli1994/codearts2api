@@ -112,30 +112,68 @@ func (h *Handler) adminCredits(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// adminCheckin 领取指定账号或全部启用账号的签到/新手活动积分。
+// checkinConcurrency 一键签到的并发上限。上游按账号独立计费/独立限流，
+// 4 路并发既能压掉串行 N 分钟级的等待，也不至于把面板拖到超时。
+const checkinConcurrency = 4
+
+// adminCheckin 一键签到：领取指定账号或全部启用账号的签到/新手活动积分。
+//
+// 不带 uid 即「一键签到」——对所有启用中的账号并发领取，逐条返回结果，
+// 供面板弹窗展示成功/失败明细。签到失败只写账号的 checkin 字段，
+// 不计入推理错误数、不触发冷却（见 pool.Checkin）。
 func (h *Handler) adminCheckin(w http.ResponseWriter, r *http.Request) {
 	body, err := readUIDBody(r)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "message": "bad json: " + err.Error()})
 		return
 	}
+	if h.cfg.Pool == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "message": "账号池未初始化"})
+		return
+	}
 	if body.UID != "" && h.cfg.Pool.Get(body.UID) == nil {
 		writeJSON(w, http.StatusNotFound, map[string]any{"ok": false, "message": "account not found"})
 		return
 	}
-	results := make([]actionResult, 0)
-	for _, uid := range h.pickTargets(body.UID) {
-		ctx, cancel := context.WithTimeout(r.Context(), time.Minute)
-		result, err := h.cfg.Pool.Checkin(ctx, uid)
-		cancel()
-		res := actionResult{UID: uid, OK: result.OK, Credits: result.Credits, Message: result.Message}
-		if err != nil {
-			res.OK, res.Message = false, err.Error()
+
+	targets := h.pickTargets(body.UID)
+	results := make([]actionResult, len(targets))
+	if len(targets) > 0 {
+		sem := make(chan struct{}, checkinConcurrency)
+		var wg sync.WaitGroup
+		for i, uid := range targets {
+			i, uid := i, uid
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				ctx, cancel := context.WithTimeout(r.Context(), time.Minute)
+				defer cancel()
+				result, cerr := h.cfg.Pool.Checkin(ctx, uid)
+				res := actionResult{UID: uid, OK: result.OK, Credits: result.Credits, Message: result.Message}
+				if cerr != nil {
+					res.OK, res.Message = false, cerr.Error()
+				}
+				results[i] = res
+			}()
 		}
-		results = append(results, res)
+		wg.Wait()
+	}
+
+	okCount, failCount := 0, 0
+	for _, res := range results {
+		if res.OK {
+			okCount++
+		} else {
+			failCount++
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok": allOK(results), "message": summaryMsg("签到/新手领取", results), "results": results,
+		"ok":      failCount == 0,
+		"message": summaryMsg("一键签到", results),
+		"results": results,
+		"summary": map[string]int{"total": len(results), "ok": okCount, "fail": failCount},
 	})
 }
 

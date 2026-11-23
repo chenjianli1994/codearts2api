@@ -141,9 +141,12 @@ input{font:inherit}
     </div>
     <div class="actions">
       <button class="btn primary" id="btnAddAccount">＋ 授权登录</button>
+      <button class="btn primary" id="btnCheckinAll">一键签到</button>
+      <button class="btn" id="btnExport">导出账号</button>
+      <button class="btn" id="btnImport">导入账号</button>
+      <input type="file" id="importFile" accept="application/json,.json" class="hidden"/>
       <button class="btn" id="btnRefresh">刷新</button>
       <button class="btn" id="btnCredits">校验账号</button>
-      <button class="btn" id="btnCheckin">全员签到</button>
       <button class="btn" id="btnKeepalive">保活 Token</button>
       <button class="btn" id="btnReload">重载 auths</button>
       <button class="btn ghost" id="btnLogout">退出</button>
@@ -194,6 +197,28 @@ input{font:inherit}
         <span>OpenAI base: <span class="mono" id="baseUrl"></span></span>
         <span>API: <span class="mono">/v1/chat/completions</span></span>
       </div>
+    </div>
+  </div>
+</div>
+
+<div id="checkinModal" class="modal-mask hidden">
+  <div class="modal">
+    <div class="modal-h">
+      <h3>一键签到结果</h3>
+      <button class="btn ghost" id="checkinClose" type="button">关闭</button>
+    </div>
+    <div class="modal-b">
+      <div class="status-line" id="checkinSummary">尚未执行</div>
+      <div style="max-height:320px;overflow:auto">
+        <table class="table">
+          <thead><tr><th>账号</th><th>结果</th></tr></thead>
+          <tbody id="checkinBody"><tr><td colspan="2" class="empty">尚未执行</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="modal-f">
+      <button class="btn" id="checkinCopy" type="button">复制结果</button>
+      <button class="btn primary" id="checkinRetry" type="button">再跑一次</button>
     </div>
   </div>
 </div>
@@ -400,9 +425,134 @@ async function runAction(path, body){
 }
 
 $("btnCredits").onclick = () => runAction("/admin/api/credits", {});
-$("btnCheckin").onclick = () => runAction("/admin/api/checkin", {});
 $("btnKeepalive").onclick = () => runAction("/admin/api/keepalive", {});
 $("btnReload").onclick = () => runAction("/admin/api/reload", {});
+
+/* ---------- 一键签到 ---------- */
+function openCheckinModal(){ $("checkinModal").classList.remove("hidden"); }
+function closeCheckinModal(){ $("checkinModal").classList.add("hidden"); }
+
+function checkinRowsText(){
+  const lines = Array.from($("checkinBody").querySelectorAll("tr"))
+    .map(tr => Array.from(tr.children).map(td => td.textContent.replace(/\s+/g, " ").trim()).join("  "))
+    .filter(s => s && !s.startsWith("尚未执行"));
+  return $("checkinSummary").textContent + "\n" + lines.join("\n");
+}
+
+async function runCheckinAll(){
+  const btn = $("btnCheckinAll");
+  if (btn.disabled) return;
+  btn.disabled = true;
+  openCheckinModal();
+  $("checkinSummary").innerHTML = '<span class="spin"></span>正在为全部启用账号签到（最多 4 路并发）…';
+  $("checkinBody").innerHTML = "";
+  try {
+    const data = await api("/admin/api/checkin", {method:"POST", body:"{}"});
+    const results = data.results || [];
+    $("checkinBody").innerHTML = results.length
+      ? results.map(r => `<tr>
+          <td class="mono" title="${escapeHtml(r.uid||"")}">${escapeHtml(shortUID(r.uid))}</td>
+          <td>${r.ok ? '<span class="badge ok">成功</span>' : '<span class="badge bad">失败</span>'}
+            <span class="${r.ok ? '' : 'muted'}">${escapeHtml(r.message || "")}</span></td>
+        </tr>`).join("")
+      : `<tr><td colspan="2" class="empty">没有启用中的账号</td></tr>`;
+    const s = data.summary || {};
+    const total = s.total ?? results.length;
+    $("checkinSummary").textContent =
+      `共 ${total} 个账号 · 成功 ${s.ok ?? results.filter(r=>r.ok).length} · 失败 ${s.fail ?? results.filter(r=>!r.ok).length}`
+      + (total ? "" : "（先添加账号，或到账号列表里启用）");
+    toast(data.message || "签到完成", !!data.ok);
+    await loadOverview();
+  } catch(e) {
+    $("checkinSummary").textContent = "签到失败: " + e.message;
+    toast(e.message, false);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+$("btnCheckinAll").onclick = runCheckinAll;
+$("checkinClose").onclick = closeCheckinModal;
+$("checkinModal").addEventListener("click", (e) => { if (e.target === $("checkinModal")) closeCheckinModal(); });
+$("checkinRetry").onclick = () => { closeCheckinModal(); setTimeout(runCheckinAll, 120); };
+$("checkinCopy").onclick = async () => {
+  try { await navigator.clipboard.writeText(checkinRowsText()); toast("已复制签到结果"); }
+  catch { toast("复制失败", false); }
+};
+
+/* ---------- 账号导入 / 导出 ---------- */
+function authHeaders(extra){
+  const h = Object.assign({}, extra || {});
+  const key = getKey();
+  if (key) h["Authorization"] = "Bearer " + key;
+  return h;
+}
+
+async function exportAccounts(masked){
+  try {
+    const res = await fetch(BASE + "/admin/api/accounts/export" + (masked ? "?mask=1" : ""),
+      {headers: authHeaders()});
+    if (!res.ok){
+      const raw = await res.text();
+      let msg = raw;
+      try { msg = JSON.parse(raw).message || raw; } catch {}
+      throw new Error(msg || ("HTTP " + res.status));
+    }
+    const blob = await res.blob();
+    const cd = res.headers.get("Content-Disposition") || "";
+    const m = /filename="?([^";]+)"?/.exec(cd);
+    const name = m ? m[1] : ("codearts-accounts-" + Date.now() + ".json");
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = name;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+    toast(masked ? "已导出（脱敏，不含密钥）" : "已导出（含密钥）");
+  } catch(e){
+    toast("导出失败: " + e.message, false);
+  }
+}
+
+$("btnExport").onclick = async () => {
+  const full = window.confirm(
+    "导出文件可作为账号备份直接导入另一台机器。\n\n" +
+    "确定 = 导出含密钥（refresh_token / AK / SK，拿到即等于拿到账号）\n" +
+    "取消 = 导出脱敏版（只有 user_id / 昵称 / 过期时间）");
+  await exportAccounts(!full);
+};
+
+$("btnImport").onclick = () => $("importFile").click();
+$("importFile").onchange = async (e) => {
+  const file = e.target.files && e.target.files[0];
+  e.target.value = "";
+  if (!file) return;
+  let text = "";
+  try { text = await file.text(); }
+  catch { toast("读取文件失败", false); return; }
+  let parsed = null;
+  try { parsed = JSON.parse(text); }
+  catch { toast("不是合法 JSON 文件", false); return; }
+  const n = Array.isArray(parsed) ? parsed.length : (Array.isArray(parsed.accounts) ? parsed.accounts.length : 1);
+  if (!window.confirm(`即将导入 ${n} 个账号。\n\n同一个 user_id 会被覆盖（包括 refresh_token），确定继续？`)) return;
+  try {
+    const res = await fetch(BASE + "/admin/api/accounts/import", {
+      method: "POST",
+      headers: authHeaders({"Content-Type": "application/json"}),
+      body: text
+    });
+    let data = {};
+    try { data = await res.json(); } catch {}
+    if (!res.ok) throw new Error(data.message || ("HTTP " + res.status));
+    const skipped = (data.results || []).filter(r => r.action === "skipped");
+    toast(data.message || "导入完成", !!data.ok);
+    if (skipped.length){
+      window.alert("以下条目被跳过：\n" + skipped.map(s => "· " + (s.uid || "(无 uid)") + "：" + s.message).join("\n"));
+    }
+    await loadOverview();
+  } catch(err){
+    toast("导入失败: " + err.message, false);
+  }
+};
 
 $("acctBody").addEventListener("click", async (e) => {
   const btn = e.target.closest("button[data-act]");
