@@ -239,6 +239,49 @@ func (h *Handler) adminOAuthStart(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// adminOAuthOpen 用服务所在机器的无痕浏览器打开当前授权链接。
+//
+// 网页端 window.open 只能落在面板已有的 cookie 容器里，华为云 portal 会直接
+// 拿原账号会话换 code —— 加第二个号必然失败。所以「打开授权链接」改由服务
+// 进程拉起 --incognito/--inprivate 新窗口。
+func (h *Handler) adminOAuthOpen(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionID string `json:"session_id"`
+		AuthURL   string `json:"auth_url"`
+	}
+	raw, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	_ = r.Body.Close()
+	if len(raw) > 0 {
+		_ = json.Unmarshal(raw, &req)
+	}
+	if req.SessionID == "" {
+		req.SessionID = r.URL.Query().Get("session_id")
+	}
+	target := ""
+	if req.SessionID != "" {
+		sess := h.oauth.get(req.SessionID)
+		if sess == nil {
+			writeJSON(w, http.StatusNotFound, map[string]any{"ok": false, "message": "会话不存在或已过期，请重新发起授权"})
+			return
+		}
+		target = sess.AuthURL
+	} else {
+		target = strings.TrimSpace(req.AuthURL)
+	}
+	if target == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "message": "缺少 session_id 或 auth_url"})
+		return
+	}
+	label, err := openIncognito(target)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "message": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "launcher": label, "message": "已用 " + label + " 打开授权页",
+	})
+}
+
 // adminOAuthPoll 轮询 ticket。
 func (h *Handler) adminOAuthPoll(w http.ResponseWriter, r *http.Request) {
 	var req struct {

@@ -59,6 +59,26 @@ type Config struct {
 		TimeoutSeconds int `json:"timeout_seconds"`
 	} `json:"upstream"`
 
+	// CLIBackend 官方 CLI 后端（codearts serve / opencode API）。
+	// 官方对裸 chat 调用加了传输层加密，直调已用模型可能拿到 TM.000010051
+	// 「无权调用该模型」；CLI 内部走加密通道可用全部模型，因此把命中 models
+	// 的请求转给它。默认关闭：CLI 是 agent 内核，每次带约 1.4 万 token 的
+	// system prompt（更贵），且只出纯文本、不返回 tool_calls。
+	CLIBackend struct {
+		Enabled         bool              `json:"enabled"`
+		Endpoint        string            `json:"endpoint"`
+		Provider        string            `json:"provider"`
+		Agent           string            `json:"agent"`
+		CodeartsExe     string            `json:"codearts_exe"`
+		CredentialsFile string            `json:"credentials_file"`
+		TimeoutSeconds  int               `json:"timeout_seconds"`
+		Models          map[string]string `json:"models"` // 小写 OpenAI ID -> CLI modelID
+		// MultimodalModels 是 serve 侧的多模态模型列表（写进 /v1/config 的
+		// multimodalModels）。CLI 默认把图片转成 ImageId 交给 analyzeImage 工具，
+		// 再由它找"可用的多模态模型"——列表为空时这一步必然失败。
+		MultimodalModels []string `json:"multimodal_models"`
+	} `json:"cli_backend"`
+
 	SoftRateDur    time.Duration
 	ErrCooldownDur time.Duration
 }
@@ -83,6 +103,17 @@ func Default() *Config {
 	c.Upstream.TimeoutSeconds = 120
 	c.BenefitAutoClaim = true // 不领取时福利模型调用必然失败（benefit not found）
 	c.CreditsAutoClaim = true
+
+	// CLI 后端默认关闭，且模型映射默认空：只有 config.json 显式列出的模型才会
+	// 走 CLI 通道。官方 CLI 的安装位置因机器而异，这里也留空（或设 CA2A_CLI_EXE）。
+	c.CLIBackend.Enabled = false
+	c.CLIBackend.Endpoint = "http://127.0.0.1:4096"
+	c.CLIBackend.Provider = "huaweicloud-maas"
+	c.CLIBackend.Agent = "build"
+	c.CLIBackend.CodeartsExe = ""
+	c.CLIBackend.CredentialsFile = "./cli-credentials.json"
+	c.CLIBackend.TimeoutSeconds = 300
+	c.CLIBackend.Models = map[string]string{}
 	return c
 }
 
@@ -185,6 +216,15 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("CA2A_OAUTH_CALLBACK_HOST"); v != "" {
 		c.OAuthCallbackHost = v
 	}
+	if v := os.Getenv("CA2A_CLI_ENABLED"); v != "" {
+		c.CLIBackend.Enabled = v == "1" || strings.EqualFold(v, "true")
+	}
+	if v := os.Getenv("CA2A_CLI_EXE"); v != "" {
+		c.CLIBackend.CodeartsExe = v
+	}
+	if v := os.Getenv("CA2A_CLI_ENDPOINT"); v != "" {
+		c.CLIBackend.Endpoint = v
+	}
 	if v := os.Getenv("CA2A_WATCH_ENABLED"); v != "" {
 		c.Watch.Enabled = v == "1" || strings.EqualFold(v, "true")
 	}
@@ -266,6 +306,26 @@ func (c *Config) normalize() error {
 	}
 	if c.MaxConcurrent <= 0 {
 		c.MaxConcurrent = 1 // 上游并发会话释放慢，单账号串行最稳
+	}
+	// CLI 后端：键统一小写（OpenAI 侧模型 ID 大小写不敏感地查表），端点与超时兜底。
+	if c.CLIBackend.Endpoint == "" {
+		c.CLIBackend.Endpoint = "http://127.0.0.1:4096"
+	}
+	if c.CLIBackend.TimeoutSeconds <= 0 {
+		c.CLIBackend.TimeoutSeconds = 300
+	}
+	if c.CLIBackend.Provider == "" {
+		c.CLIBackend.Provider = "huaweicloud-maas"
+	}
+	if c.CLIBackend.Agent == "" {
+		c.CLIBackend.Agent = "build"
+	}
+	if len(c.CLIBackend.Models) > 0 {
+		norm := make(map[string]string, len(c.CLIBackend.Models))
+		for k, v := range c.CLIBackend.Models {
+			norm[strings.ToLower(strings.TrimSpace(k))] = v
+		}
+		c.CLIBackend.Models = norm
 	}
 	return nil
 }

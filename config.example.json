@@ -26,5 +26,24 @@
   },
   "upstream": {
     "timeout_seconds": 120
+  },
+
+  // 官方 CLI 后端（codearts serve）：用官方 CLI 的加密通道调用模型，绕开直调的
+  // TM.000010051「无权调用该模型」。默认关闭：CLI 是 agent 内核，每次请求带约
+  // 1.4 万 token 的 system prompt（更贵），且只出纯文本、不返回 tool_calls。
+  // 只有 models 里列出的模型（键=OpenAI 侧模型 ID，值=CLI 侧 modelID）走 CLI，
+  // 其余模型仍走直连。启用前需装好官方 CLI 并在 codearts_exe 填它的路径
+  // （或设置环境变量 CA2A_CLI_EXE）；cli-credentials.json 里放 {"ak":"...","sk":"..."}。
+  "cli_backend": {
+    "enabled": false,
+    "endpoint": "http://127.0.0.1:4096",
+    "provider": "huaweicloud-maas",
+    "agent": "build",
+    "codearts_exe": "",
+    "credentials_file": "./cli-credentials.json",
+    "timeout_seconds": 300,
+    "models": {},
+    // "models": { "deepseek-v4.1-flash": "deepseek-v4.1-flash" },
+    "multimodal_models": []
   }
 }

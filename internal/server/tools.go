@@ -249,3 +249,30 @@ func toOpenAIToolCalls(calls []openAIToolCall) []map[string]any {
 	}
 	return out
 }
+
+// filterKnownCalls 只保留客户端声明过的工具名：模型（尤其被 prompt 包装的 CLI
+// 路径）会自己发明工具名，发回去只会让客户端执行失败并陷入死循环。
+func filterKnownCalls(calls []openAIToolCall, tools []map[string]any) (kept []openAIToolCall, dropped []string) {
+	if len(calls) == 0 || len(tools) == 0 {
+		return calls, nil
+	}
+	known := map[string]bool{}
+	for _, t := range tools {
+		if fn, ok := t["function"].(map[string]any); ok {
+			if n, _ := fn["name"].(string); n != "" {
+				known[n] = true
+			}
+		}
+	}
+	if len(known) == 0 {
+		return calls, nil
+	}
+	for _, c := range calls {
+		if known[c.Name] {
+			kept = append(kept, c)
+		} else {
+			dropped = append(dropped, c.Name)
+		}
+	}
+	return kept, dropped
+}

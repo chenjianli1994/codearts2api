@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"codearts2api/internal/auth"
+	"codearts2api/internal/cli"
 	"codearts2api/internal/pool"
 	"codearts2api/internal/upstream"
 )
@@ -47,6 +48,22 @@ type Config struct {
 	LoginConfig upstream.LoginConfig
 	// OAuthCallbackHost 可选：覆盖授权链接回调 host（如 https://oneapi.example.com/codearts）。
 	OAuthCallbackHost string
+
+	// CLI 官方客户端后端（codearts serve / opencode API）。
+	//
+	// 背景：官方对 snap-access 裸 chat 调用加了传输层加密，直调已用模型可能拿到
+	// TM.000010051「无权调用该模型」；CLI 内部走加密通道可用全部模型。因此命中
+	// CLIModels 的模型转给 CLI，其余仍走原直连路径。
+	CLI         *cli.Client
+	CLIProvider string            // 例如 huaweicloud-maas
+	CLIAgent    string            // 例如 build
+	CLIModels   map[string]string // 小写 OpenAI 模型 ID -> CLI modelID
+	// CLIEnabled 配置里是否开启 CLI 后端（区分「没开」与「开了但没起来」）。
+	CLIEnabled bool
+	// CLIEndpoint 配置里的 serve 地址（面板展示用）。
+	CLIEndpoint string
+	// CLIMultimodal serve 侧配置的多模态模型列表（面板展示用）。
+	CLIMultimodal []string
 }
 
 var dynamicModelsCache struct {
@@ -118,6 +135,15 @@ func NewHandler(cfg Config) *Handler {
 	if cfg.MaxRotate <= 0 {
 		cfg.MaxRotate = 3
 	}
+	// CLI 模型映射统一小写：OpenAI 客户端传的模型 ID 大小写不定，而配置里写的是
+	// 人读的原始 ID（如 GLM-5.2），查表前必须归一，否则「配了却命不中」。
+	if len(cfg.CLIModels) > 0 {
+		norm := make(map[string]string, len(cfg.CLIModels))
+		for k, v := range cfg.CLIModels {
+			norm[strings.ToLower(strings.TrimSpace(k))] = v
+		}
+		cfg.CLIModels = norm
+	}
 	if cfg.SoftCooldown <= 0 {
 		cfg.SoftCooldown = 60 * time.Second
 	}
@@ -171,6 +197,7 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /admin/api/accounts/disable", h.withAuth(h.adminDisable))
 	h.mux.HandleFunc("POST /admin/api/accounts/clear-cooldown", h.withAuth(h.adminClearCooldown))
 	h.mux.HandleFunc("POST /admin/api/oauth/start", h.withAuth(h.adminOAuthStart))
+	h.mux.HandleFunc("POST /admin/api/oauth/open", h.withAuth(h.adminOAuthOpen))
 	h.mux.HandleFunc("POST /admin/api/oauth/poll", h.withAuth(h.adminOAuthPoll))
 	h.mux.HandleFunc("POST /admin/api/oauth/import-callback", h.withAuth(h.adminOAuthImportCallback))
 	h.mux.HandleFunc("GET /oauth/callback", h.oauthCallback)
@@ -406,6 +433,11 @@ func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 // modelList 动态获取模型列表并包装成 OpenAI 格式。
 func (h *Handler) modelList() []map[string]any {
 	entries := modelEntries(h.fetchDynamicModels())
+	// CLI 后端能用的模型单独补进列表：它们不在直连可用目录里（直连对这些模型
+	// 会回 TM.000010051），但对客户端必须可见。
+	if extra := h.cliModelExtras(entries); len(extra) > 0 {
+		entries = append(entries, extra...)
+	}
 	// 过滤掉「已知不可用」的模型：这些条目在客户端点开就是 404 / benefit not
 	// found，列出来只会误导。必须作用在最终条目上——静态兜底表也会补位，
 	// 只在动态结果上过滤会让被下架的模型又从静态表冒出来。
@@ -688,6 +720,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	model := h.cfg.DefaultModel
 	if req.Model != "" && req.Model != "auto" {
 		model = req.Model
+	}
+
+	// 命中 CLI 后端的模型走 codearts serve（官方 CLI 走加密通道，可绕开直调的
+	// TM.000010051「无权调用该模型」）；其余保持原直连路径不变。
+	if cliModel, ok := h.cliModelFor(model); ok {
+		h.chatViaCLI(w, r, req, cliModel, affinity)
+		return
 	}
 
 	// OpenAI 线格式本身不携带会话 ID；conversationIDFor 用首条 user 消息

@@ -452,6 +452,26 @@ function closeOAuthModal(){
   $("oauthModal").classList.add("hidden");
 }
 
+// 授权页必须开在无痕容器里：portal 用浏览器 cookie 认身份，同一容器已有会话
+// 会直接换回原账号的 code，第二个号永远加不进去。网页 JS 开不了无痕窗口，
+// 所以交给服务端拉起 --incognito / --inprivate。
+async function openAuthInIncognito(){
+  const u = $("oauthUrl").textContent.trim();
+  if (oauthSessionId) {
+    try {
+      const data = await api("/admin/api/oauth/open", {method:"POST", body: JSON.stringify({session_id: oauthSessionId})});
+      if (!data.ok) throw new Error(data.message || "打开失败");
+      setOAuthStatus("已在「" + (data.launcher || "无痕窗口") + "」打开授权页，请用另一个华为云账号登录。正在自动检测…", null);
+      return;
+    } catch (e) {
+      if (u && u.startsWith("http")) window.open(u, "_blank", "noopener,noreferrer");
+      setOAuthStatus("无痕打开失败（" + e.message + "）：已用当前浏览器打开，请把链接粘贴到无痕窗口再登录。", false);
+      return;
+    }
+  }
+  if (u && u.startsWith("http")) window.open(u, "_blank", "noopener,noreferrer");
+}
+
 async function startOAuth(){
   if (oauthBusy) return;
   oauthBusy = true;
@@ -466,9 +486,9 @@ async function startOAuth(){
     $("oauthOpen").disabled = false;
     $("oauthImport").disabled = false;
     $("oauthPoll").disabled = false;
-    setOAuthStatus("已生成链接，请打开授权页完成登录。正在自动检测…", null);
-    // 自动打开
-    try { window.open(data.auth_url, "_blank", "noopener,noreferrer"); } catch {}
+    setOAuthStatus("已生成链接，正在无痕窗口打开授权页…", null);
+    // 自动用无痕窗口打开（由服务端拉起浏览器，避免复用已有登录态）
+    await openAuthInIncognito();
     stopOAuthPoll();
     oauthTimer = setInterval(() => pollOAuth(true), 2500);
     // 立即 poll 一次（通常还是 pending）
@@ -555,10 +575,7 @@ $("oauthModal").addEventListener("click", (e) => { if (e.target === $("oauthModa
 $("oauthStart").onclick = startOAuth;
 $("oauthPoll").onclick = () => pollOAuth(false);
 $("oauthImport").onclick = importOAuthCallback;
-$("oauthOpen").onclick = () => {
-  const u = $("oauthUrl").textContent.trim();
-  if (u && u.startsWith("http")) window.open(u, "_blank", "noopener,noreferrer");
-};
+$("oauthOpen").onclick = () => { openAuthInIncognito(); };
 $("oauthCopy").onclick = async () => {
   const u = $("oauthUrl").textContent.trim();
   try {

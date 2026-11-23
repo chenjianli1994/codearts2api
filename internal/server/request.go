@@ -28,6 +28,9 @@ type openAIMessage struct {
 	ToolCalls        []openAIToolCall
 	ToolCallID       string // role=tool 时对应的 call id
 	Name             string // role=tool 时的函数名（部分客户端会带）
+	// Parts content 是分片数组时的原始分片（图片等非文本分片只有这里存得下）。
+	// CLI 后端按它把 data: URL 图片作为 file part 透传。
+	Parts []map[string]any
 }
 
 // toolChoiceOpenAI 归一化后的 tool_choice。
@@ -139,6 +142,7 @@ func parseMessage(rm json.RawMessage) (openAIMessage, error) {
 		ReasoningContent: probe.ReasoningContent,
 		ToolCallID:       probe.ToolCallID,
 		Name:             probe.Name,
+		Parts:            contentParts(probe.Content),
 	}
 	if len(probe.ToolCalls) > 0 && string(probe.ToolCalls) != "null" {
 		var calls []struct {
@@ -182,6 +186,18 @@ func flattenContent(raw json.RawMessage) string {
 		return sb.String()
 	}
 	return ""
+}
+
+// contentParts 取 content 的分片数组形态（string 形态返回 nil）。
+func contentParts(raw json.RawMessage) []map[string]any {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	var parts []map[string]any
+	if err := json.Unmarshal(raw, &parts); err != nil {
+		return nil
+	}
+	return parts
 }
 
 // rawJSONString 把 arguments 统一成 JSON 字符串（兼容字符串与对象两种线格式）。
