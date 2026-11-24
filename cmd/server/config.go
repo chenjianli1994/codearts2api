@@ -30,6 +30,23 @@ type Config struct {
 		ErrCooldown string `json:"err_cooldown"`
 	} `json:"cooldown"`
 
+	// Session 会话粘性：同一 conversation_id 的连续请求锁定同一账号，
+	// 多轮对话更连贯、也少占上游并发会话。ttl 到点自动解绑。
+	// 口径与面板表单一致：ttl / gc_interval 都写时长文本（如 "30m" / "5m"）。
+	Session struct {
+		Enabled bool   `json:"enabled"`
+		TTL     string `json:"ttl"`
+		GC      string `json:"gc_interval"`
+		// 兼容 B45 早期写过的分钟口径
+		TTLMinutes int `json:"ttl_minutes,omitempty"`
+		GCMinutes  int `json:"gc_minutes,omitempty"`
+	} `json:"session"`
+
+	// Outbound 出站标识：发往华为云的请求头。user_agent 留空 = Go 默认 UA。
+	Outbound struct {
+		UserAgent string `json:"user_agent"`
+	} `json:"outbound"`
+
 	Watch struct {
 		Enabled           bool `json:"enabled"`
 		PollMinutes       int  `json:"poll_minutes"`
@@ -94,6 +111,10 @@ func Default() *Config {
 	c.Cooldown.SoftRate = "60s"
 	c.Cooldown.ErrThresh = 3
 	c.Cooldown.ErrCooldown = "10m"
+	c.Session.Enabled = true
+	c.Session.TTL = "30m"
+	c.Session.GC = "5m"
+	c.Outbound.UserAgent = ""
 	c.Watch.Enabled = true
 	c.Watch.PollMinutes = 30
 	c.Watch.RefreshSkewM = 30

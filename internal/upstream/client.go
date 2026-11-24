@@ -143,9 +143,10 @@ func New(timeout time.Duration) *Client {
 		IdleConnTimeout:       90 * time.Second,
 		ResponseHeaderTimeout: 120 * time.Second,
 	}
+	var transport http.RoundTripper = uaTransport{base: tr}
 	c := &Client{
-		http:        &http.Client{Timeout: timeout, Transport: tr},
-		streamHTTP:  &http.Client{Transport: tr},
+		http:        &http.Client{Timeout: timeout, Transport: transport},
+		streamHTTP:  &http.Client{Transport: transport},
 		snapBase:    SnapEngineApiHost,
 		benefitBase: BenefitHost,
 		srcFail:     map[string]time.Time{},
@@ -896,4 +897,24 @@ func (c *Client) getSigned(ctx context.Context, urlStr string, cred SignCredenti
 		return nil, &ApiError{Code: resp.StatusCode, Status: resp.StatusCode, Message: truncateStr(string(raw), 300), Path: req.URL.Path}
 	}
 	return raw, nil
+}
+
+// ── 出站标识（B45）────────────────────────────────────────────────────────
+
+// outboundUA 出站 User-Agent（空 = 用 Go 默认）。读在每次请求上，改完即时生效。
+var outboundUA atomic.Value
+
+// SetUserAgent 覆盖所有发往华为云请求的 User-Agent（空串 = 用默认）。
+func SetUserAgent(ua string) { outboundUA.Store(strings.TrimSpace(ua)) }
+
+// uaTransport 在请求本身没带 User-Agent 时补上配置值。
+type uaTransport struct{ base http.RoundTripper }
+
+func (t uaTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	ua, _ := outboundUA.Load().(string)
+	if ua != "" && r.Header.Get("User-Agent") == "" {
+		r = r.Clone(r.Context())
+		r.Header.Set("User-Agent", ua)
+	}
+	return t.base.RoundTrip(r)
 }

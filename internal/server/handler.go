@@ -2,6 +2,7 @@
 package server
 
 import (
+	"context"
 	crand "crypto/rand"
 	"crypto/subtle"
 	"encoding/base64"
@@ -30,6 +31,8 @@ type Config struct {
 	Upstream     *upstream.Client
 	APIKey       string
 	MaxRotate    int
+	// Session 会话粘性（B45：面板可改）。
+	Session SessionConfig
 	SoftCooldown time.Duration
 	ErrThreshold int
 	ErrCooldown  time.Duration
@@ -117,7 +120,7 @@ type Handler struct {
 	convMu sync.Mutex
 	chats  map[string]string // account → 最近 chat_id
 	// 黏性路由：conversation_id → account_name（多轮续接锁定同一账号，减少上游并发会话占用）。
-	convAcct map[string]string
+	convAcct map[string]convPin
 
 	loginMu sync.Mutex
 	logins  map[string]*pendingLogin
@@ -180,7 +183,7 @@ func NewHandler(cfg Config) *Handler {
 		cfg: cfg, mux: http.NewServeMux(), oauth: newOAuthStore(),
 		access: newAccessLogger(),
 		chats: map[string]string{}, logins: map[string]*pendingLogin{},
-		convAcct: map[string]string{},
+		convAcct: map[string]convPin{},
 	}
 	h.loadChats()
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
@@ -742,9 +745,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	explicitChat := validChatID(req.ConversationID)
 	stickyAcct := ""
 	if explicitChat {
-		h.convMu.Lock()
-		stickyAcct = h.convAcct[req.ConversationID]
-		h.convMu.Unlock()
+		stickyAcct = h.stickyAccount(req.ConversationID)
 	}
 	msgs := buildUpstreamMessages(req, toolsOn)
 
@@ -957,7 +958,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			h.convMu.Lock()
 			h.chats[acct.Name] = chatID
-			h.convAcct[req.ConversationID] = acct.Name // 黏性路由：续接锁定同账号
+			// 这里已经持有 convMu：写粘性记录必须直接写字段，不能再调 setStickyAccount
+			// （它内部会 Lock 同一个 Mutex —— 那会自死锁：请求拿到上游响应后永久挂住）。
+			if h.cfg.Session.Enabled && req.ConversationID != "" {
+				h.convAcct[req.ConversationID] = convPin{acct: acct.Name, at: time.Now()}
+			}
 			h.convMu.Unlock()
 			h.saveChats()
 		}
@@ -1379,4 +1384,88 @@ func (h *Handler) saveChats() {
 		return
 	}
 	_ = os.Rename(h.cfg.ConvStateFile+".tmp", h.cfg.ConvStateFile)
+}
+
+// ── 会话粘性（B45）────────────────────────────────────────────────────────
+
+// SessionConfig 会话粘性配置：开关、保持时长与清理周期。
+type SessionConfig struct {
+	Enabled bool
+	TTL     time.Duration
+	GC      time.Duration
+}
+
+// convPin 一条会话绑定：账号名 + 最后活动时间（判 TTL 用）。
+type convPin struct {
+	acct string
+	at   time.Time
+}
+
+// stickyAccount 读取会话绑定；开关关闭、记录过期或不存在都返回空串。
+func (h *Handler) stickyAccount(convID string) string {
+	if convID == "" || !h.cfg.Session.Enabled {
+		return ""
+	}
+	h.convMu.Lock()
+	pin, ok := h.convAcct[convID]
+	h.convMu.Unlock()
+	if !ok || pin.acct == "" {
+		return ""
+	}
+	if ttl := h.sessionTTL(); ttl > 0 && time.Since(pin.at) > ttl {
+		h.forgetSticky(convID)
+		return ""
+	}
+	return pin.acct
+}
+
+// setStickyAccount 记录或刷新一条会话绑定；开关关闭时不记录。
+func (h *Handler) setStickyAccount(convID, acct string) {
+	if convID == "" || acct == "" || !h.cfg.Session.Enabled {
+		return
+	}
+	h.convMu.Lock()
+	h.convAcct[convID] = convPin{acct: acct, at: time.Now()}
+	h.convMu.Unlock()
+}
+
+func (h *Handler) forgetSticky(convID string) {
+	h.convMu.Lock()
+	delete(h.convAcct, convID)
+	h.convMu.Unlock()
+}
+
+func (h *Handler) sessionTTL() time.Duration {
+	if h.cfg.Session.TTL <= 0 {
+		return 30 * time.Minute
+	}
+	return h.cfg.Session.TTL
+}
+
+// RunConversationGC 按 session.gc 周期清理过期绑定，阻塞到 ctx 结束。
+func (h *Handler) RunConversationGC(ctx context.Context) {
+	interval := h.cfg.Session.GC
+	if interval <= 0 {
+		interval = 5 * time.Minute
+	}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if !h.cfg.Session.Enabled {
+				continue
+			}
+			cutoff := time.Now().Add(-h.sessionTTL())
+			h.convMu.Lock()
+			for k, v := range h.convAcct {
+				if v.at.Before(cutoff) {
+					delete(h.convAcct, k)
+				}
+			}
+			h.convMu.Unlock()
+		}
+	}
 }

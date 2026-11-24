@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"strings"
 	"time"
 
 	"codearts2api/internal/auth"
@@ -104,6 +105,11 @@ func main() {
 		}(),
 		QueueMaxAttempts: cfg.QueueMaxAttempts,
 		ConvStateFile:    cfg.StateFile + ".chats.json",
+		Session: server.SessionConfig{
+			Enabled: cfg.Session.Enabled,
+			TTL:     sessionDuration(cfg.Session.TTL, cfg.Session.TTLMinutes, 30*time.Minute),
+			GC:      sessionDuration(cfg.Session.GC, cfg.Session.GCMinutes, 5*time.Minute),
+		},
 		WatchInfo: map[string]any{
 			"enabled":              cfg.Watch.Enabled,
 			"credits_auto_claim":   cfg.CreditsAutoClaim,
@@ -130,7 +136,9 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go sch.Run(ctx)
+	go h.RunConversationGC(ctx)
 	h.StartAvailabilityProber(ctx)
+	upstream.SetUserAgent(cfg.Outbound.UserAgent)
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,
@@ -170,4 +178,18 @@ func loginConfig(cfg *Config) upstream.LoginConfig {
 		}
 	}
 	return lc
+}
+
+// sessionDuration 解析会话段里的时长文本（如 "30m" / "5m" / "600s"）。
+// 文本为空时回落到老的分钟字段，再不行用 fallback。
+func sessionDuration(text string, legacyMinutes int, fallback time.Duration) time.Duration {
+	if s := strings.TrimSpace(text); s != "" {
+		if d, err := time.ParseDuration(s); err == nil && d > 0 {
+			return d
+		}
+	}
+	if legacyMinutes > 0 {
+		return time.Duration(legacyMinutes) * time.Minute
+	}
+	return fallback
 }
