@@ -451,6 +451,11 @@ func Aggregate(r io.Reader, model string) (map[string]any, error) {
 			message["content"] = nil
 		}
 	}
+	// 思考内容兜底为正文：正文一个字都没有、推理有内容且没有工具调用时，
+	// 把推理原文当正文下发（客户端只读 content 时不至于显示空回复）。
+	if reasoningAsContent.Load() && rc.Content == "" && rc.Reasoning != "" && len(rc.ToolCalls) == 0 {
+		message["content"] = rc.Reasoning
+	}
 	return map[string]any{
 		"id":      fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano()),
 		"object":  "chat.completion",
@@ -520,7 +525,20 @@ func StreamCaptureWithUsage(w http.ResponseWriter, r io.Reader, model string, on
 		}
 		return nil
 	}
+	// writeBackfill 流式兜底：整段流里正文一个字都没出，而推理有内容、也没有工具调用时，
+	// 在收尾前把推理原文当正文补一帧。代价同非流式：两端都渲染时同一段话说两遍。
+	writeBackfill := func() error {
+		if !reasoningAsContent.Load() || content.Len() > 0 || reason.Len() == 0 || len(calls) > 0 {
+			return nil
+		}
+		return writeChunk(map[string]any{"content": reason.String()}, "")
+	}
 	writeDONE := func(success bool) error {
+		if success {
+			if err := writeBackfill(); err != nil {
+				return err
+			}
+		}
 		if success && usageFor != nil {
 			chunk := map[string]any{
 				"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(),

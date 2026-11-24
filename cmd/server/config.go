@@ -46,6 +46,19 @@ type Config struct {
 	Outbound struct {
 		UserAgent string `json:"user_agent"`
 	} `json:"outbound"`
+	// Features 上游的进阶行为开关。
+	Features struct {
+		// SanitizeBlacklistFingerprints 出站请求指纹脱敏：剥掉客户端塞进 system
+		// 与 tool 参数里的 x-anthropic-billing-hdr / cc_* 这类固定指纹，
+		// 降低被上游按逐字模板判异常的概率。默认 true；false 完全还原。
+		SanitizeBlacklistFingerprints bool `json:"sanitize_blacklist_fingerprints"`
+	} `json:"features"`
+
+	// ReasoningAsContent 思考内容兜底为正文（默认 true）：模型在思考模式下正文为空时，
+	// 把推理原文同时作为正文下发，避免只看正文的客户端显示空回复。
+	// 代价：同时渲染推理与正文的客户端会把同一段话说两遍。
+	ReasoningAsContent *bool `json:"reasoning_as_content"`
+
 
 	Watch struct {
 		Enabled           bool `json:"enabled"`
@@ -115,6 +128,9 @@ func Default() *Config {
 	c.Session.TTL = "30m"
 	c.Session.GC = "5m"
 	c.Outbound.UserAgent = ""
+	c.Features.SanitizeBlacklistFingerprints = true
+	reasoningAsContentDefault := true
+	c.ReasoningAsContent = &reasoningAsContentDefault
 	c.Watch.Enabled = true
 	c.Watch.PollMinutes = 30
 	c.Watch.RefreshSkewM = 30

@@ -139,6 +139,8 @@ func main() {
 	go h.RunConversationGC(ctx)
 	h.StartAvailabilityProber(ctx)
 	upstream.SetUserAgent(cfg.Outbound.UserAgent)
+	upstream.SetSanitizeOutbound(cfg.Features.SanitizeBlacklistFingerprints)
+	upstream.SetReasoningAsContent(cfg.ReasoningAsContent == nil || *cfg.ReasoningAsContent)
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,

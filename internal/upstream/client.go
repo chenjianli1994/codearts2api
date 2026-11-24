@@ -479,10 +479,14 @@ func (c *Client) ChatStreamWithOptions(ctx context.Context, chatID string, messa
 
 // chatBodyV2 组装 /api/v2/chat/completions 请求体（原生 OpenAI 形状）。
 func chatBodyV2(chatID string, messages []ChatMessage, model string, opts ChatOptions) map[string]any {
+	wireMessages := chatMessagesToOpenAI(messages)
+	if sanitizeOutbound.Load() {
+		SanitizeOutboundMessages(wireMessages)
+	}
 	body := map[string]any{
 		"model":            CanonicalModel(model),
 		"stream":           true,
-		"messages":         chatMessagesToOpenAI(messages),
+		"messages":         wireMessages,
 		"prompt_cache_key": chatID,
 		"tool_stream":      true,
 	}
