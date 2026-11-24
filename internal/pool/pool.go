@@ -48,6 +48,7 @@ type Account struct {
 	lastErr           string
 	activeConcurrent  int       // 当前活跃并发请求数
 	maxConcurrent     int       // 最大允许并发数
+	lastRelease       time.Time // 上一次释放槽位的时间（选号用它做「最久没用优先」）
 	keepaliveLastPing time.Time // 最后保活心跳时间
 }
 
@@ -299,23 +300,57 @@ func (p *Pool) SyncToDir(auths []*auth.Auth) {
 	p.accounts = next
 }
 
-// PickExcluding 挑一个健康账号。
+// PickExcluding 挑一个健康账号：优先「还有空闲并发槽位」的，其次槽位占用最少的。
+//
+// 原实现只取第一个健康账号，于是所有流量都挤在同一账号上——单账号 max_concurrent=1 时，
+// 第二个账号永远闲置，串行请求又要等华为侧释放上一次会话（十几秒），首字延时被拖到 20-30s。
+// 这里改成按负载挑号，仍保持确定性顺序（同负载取文件顺序靠前的），不引入随机性。
 func (p *Pool) PickExcluding(tried map[string]bool) *Account {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
+	var best *Account
+	bestFree := false
+	bestActive := int(^uint(0) >> 1) // max int
 	for _, a := range p.accounts {
 		if tried != nil && tried[a.Name] {
 			continue
 		}
 		a.mu.Lock()
 		healthy := !a.disabled && now.After(a.coolUntil)
+		active := a.activeConcurrent
+		maxc := a.maxConcurrent
 		a.mu.Unlock()
-		if healthy {
-			return a
+		if !healthy {
+			continue
+		}
+		free := active < maxc
+		// 有空槽位的优先；同为空槽再比占用数；占用相同则「最久没用」的优先
+		// （华为侧会话释放要 ~60s，刚用过的账号更容易撞「并发会话数已达上限」）。
+		if best == nil {
+			best, bestFree, bestActive = a, free, active
+			continue
+		}
+		if free != bestFree {
+			if free {
+				best, bestFree, bestActive = a, free, active
+			}
+			continue
+		}
+		if active < bestActive {
+			best, bestFree, bestActive = a, free, active
+			continue
+		}
+		if active == bestActive {
+			a.mu.Lock()
+			cur, cand := a.lastRelease, best.lastRelease
+			a.mu.Unlock()
+			if cur.Before(cand) {
+				best, bestFree, bestActive = a, free, active
+			}
 		}
 	}
-	return nil
+	return best
 }
 
 // Validate 校验并（必要时）自动刷新 token。带 5 分钟缓存。
@@ -494,6 +529,42 @@ func (p *Pool) AcquireLock(name string) bool {
 	return false
 }
 
+// PickOtherIdle 找「除 exclude 之外、健康且还有空闲槽位」的账号；没有则返回 nil。
+// 用途：某个账号被上游排队限流时，立刻换到另一个空闲账号，而不是在同一个账号上等它释放。
+func (p *Pool) PickOtherIdle(exclude string) *Account {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+	var best *Account
+	bestActive := int(^uint(0) >> 1)
+	for _, a := range p.accounts {
+		if a.Name == exclude {
+			continue
+		}
+		a.mu.Lock()
+		healthy := !a.disabled && now.After(a.coolUntil)
+		active := a.activeConcurrent
+		maxc := a.maxConcurrent
+		a.mu.Unlock()
+		if !healthy || active >= maxc {
+			continue
+		}
+		if active < bestActive {
+			best, bestActive = a, active
+			continue
+		}
+		if best != nil && active == bestActive {
+			a.mu.Lock()
+			cur, cand := a.lastRelease, best.lastRelease
+			a.mu.Unlock()
+			if cur.Before(cand) {
+				best, bestActive = a, active
+			}
+		}
+	}
+	return best
+}
+
 // ReleaseLock 释放账号的并发请求锁，并唤醒等待槽位的请求。
 func (p *Pool) ReleaseLock(name string) {
 	p.mu.Lock()
@@ -504,6 +575,7 @@ func (p *Pool) ReleaseLock(name string) {
 			if a.activeConcurrent > 0 {
 				a.activeConcurrent--
 			}
+			a.lastRelease = time.Now()
 			a.mu.Unlock()
 			break
 		}

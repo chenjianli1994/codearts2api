@@ -862,11 +862,41 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			if errors.As(serr, &ae) && isQueueLimitError(ae) {
-				log.Printf("upstream queue limit retry=%d/%d account=%s, waiting %s", retry+1, h.cfg.QueueMaxAttempts, acct.Name, h.cfg.QueueRetryDelay)
+				// 华为侧会话释放有十几秒滞后，固定 10s 等待会把首字拖到 20-30s。
+				// 改成 2s 起翻倍、封顶 QueueRetryDelay：短时间内可能刚好赶上释放。
+				delay := queueBackoff(retry, h.cfg.QueueRetryDelay)
+				log.Printf("upstream queue limit retry=%d/%d account=%s, waiting %s",
+					retry+1, h.cfg.QueueMaxAttempts, acct.Name, delay)
 				// 释放锁让其他请求有机会，等待后重新获取
 				h.cfg.Pool.ReleaseLock(acct.Name)
+				// 队列限流是按上游 chat_id 排的：同一条会话被拒后重试仍排在同一条队列，
+				// 实测能一路等到 50s+；同一时刻新会话却能立刻拿到槽位。因此重试前换一条新会话
+				// （客户端显式指定 chat_id 时不改），并解除账号黏性，让选号可以换号。
+				stickyAcct = ""
+				// 注意：这里**不要**给每次重试换新 chat_id。上游按账号统计「并发会话数」，
+				// 每换一次就多一个会话，反而更快撞上限（实测换会话后重试次数从 7 次涨到 9 次）。
+				// 能换号就换号：另一个账号此刻往往是空的，干等这个账号释放要 60s。
+				// 但换号必须配一次短停：两个账号同时被限流时若无等待，会在几秒内来回切 30 次，
+				// 把上游打成 concurrent limit (transient)，请求直接失败。所以只在最初几次
+				// 重试里换号，之后老实按退避等。
+				if retry < 6 {
+					if alt := h.cfg.Pool.PickOtherIdle(acct.Name); alt != nil {
+						if h.cfg.Pool.AcquireLockWait(alt.Name, 5*time.Second) {
+							log.Printf("upstream queue limit: switch account %s -> %s (retry=%d)",
+								acct.Name, alt.Name, retry+1)
+							select {
+							case <-time.After(1500 * time.Millisecond):
+							case <-r.Context().Done():
+								h.cfg.Pool.ReleaseLock(alt.Name)
+								return
+							}
+							acct = alt
+							continue
+						}
+					}
+				}
 				select {
-				case <-time.After(h.cfg.QueueRetryDelay):
+				case <-time.After(delay):
 				case <-r.Context().Done():
 					writeOpenAIError(w, http.StatusServiceUnavailable, "client_cancelled", "client disconnected")
 					return
@@ -1250,6 +1280,23 @@ func isConcurrentLimitError(msg string) bool {
 	low := strings.ToLower(msg)
 	return strings.Contains(low, "tm.00001041") || strings.Contains(low, "并发会话")
 }
+
+// queueBackoff 队列限流重试等待：2s 起翻倍，封顶 fallback（默认 10s）。
+// 华为侧会话释放滞后通常 10-20s，越早回来重试越可能刚好碰上释放时刻。
+func queueBackoff(retry int, fallback time.Duration) time.Duration {
+	if fallback <= 0 {
+		fallback = 10 * time.Second
+	}
+	d := 2 * time.Second
+	for i := 0; i < retry; i++ {
+		d *= 2
+		if d >= fallback {
+			return fallback
+		}
+	}
+	return d
+}
+
 
 func isQueueLimitError(err *upstream.ApiError) bool {
 	if err == nil {
