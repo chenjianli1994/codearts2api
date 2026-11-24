@@ -111,6 +111,9 @@ type Handler struct {
 	mux   *http.ServeMux
 	oauth *oauthStore
 
+	// 每请求一行的访问日志：面板「本日调用 / 最近调用」的唯一来源。
+	access *accessLogger
+
 	convMu sync.Mutex
 	chats  map[string]string // account → 最近 chat_id
 	// 黏性路由：conversation_id → account_name（多轮续接锁定同一账号，减少上游并发会话占用）。
@@ -175,6 +178,7 @@ func NewHandler(cfg Config) *Handler {
 	}
 	h := &Handler{
 		cfg: cfg, mux: http.NewServeMux(), oauth: newOAuthStore(),
+		access: newAccessLogger(),
 		chats: map[string]string{}, logins: map[string]*pendingLogin{},
 		convAcct: map[string]string{},
 	}
@@ -690,6 +694,7 @@ func catalogHas(models []upstream.ModelInfo, wantLower string) bool {
 // ---------------------------------------------------------------------------
 
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
@@ -931,7 +936,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if req.IncludeUsage {
 				usage = func(comp *upstream.RawCompletion) map[string]any { return usageEstimate(msgs, comp) }
 			}
+			var firstAt time.Time
+			var streamTokens int
 			werr := upstream.StreamCaptureWithUsage(w, rc, model, func(comp *upstream.RawCompletion) {
+				if firstAt.IsZero() {
+					firstAt = time.Now() // 回调第一次进来 = 首字节到达
+				}
+				if comp.Usage != nil {
+					streamTokens = usageTokens(comp.Usage)
+				}
 				storeChat()
 				// 流式传输中定期保活
 				h.cfg.Pool.PingKeepalive(acct.Name)
@@ -948,6 +961,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				markUsable(acct.UID, model)
 				h.cfg.Pool.NoteSuccess(acct.Name)
 			}
+			status := http.StatusOK
+			if werr != nil {
+				status = http.StatusBadGateway
+			}
+			var ttfb time.Duration
+			if !firstAt.IsZero() {
+				ttfb = firstAt.Sub(started)
+			}
+			h.logAccess(model, true, status, acct, started, ttfb, streamTokens)
 			h.cfg.Pool.ReleaseLock(acct.Name) // 释放锁
 			return
 		}
@@ -974,7 +996,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		storeChat()
 		h.cfg.Pool.NoteSuccess(acct.Name)
 
-		writeJSON(w, http.StatusOK, buildCompletion(model, comp.Reasoning, content, calls, finish, chatID, usageEstimate(msgs, comp)))
+		usage := usageEstimate(msgs, comp)
+		// 非流式拿不到「首字节」时刻（聚合完才有结果），TTFB 记 0 而不是拿总耗时冒充。
+		h.logAccess(model, false, http.StatusOK, acct, started, 0, usageTokens(usage))
+		writeJSON(w, http.StatusOK, buildCompletion(model, comp.Reasoning, content, calls, finish, chatID, usage))
 		return
 	}
 	if lastErr == nil && modelAccessErr != nil {
